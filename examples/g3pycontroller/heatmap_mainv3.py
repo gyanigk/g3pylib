@@ -9,7 +9,6 @@ from typing import List, Optional, Set, Tuple, cast
 import aiohttp
 import numpy as np
 from eventkinds import AppEventKind, ControlEventKind
-from intent_predictor import IntentPredictor
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -169,41 +168,6 @@ Builder.load_string("""
                 Button:
                     text: "Reset Heatmap"
                     on_press: app.reset_heatmap()
-            Label:
-                text: "Intent Prediction"
-                size_hint_y: None
-                height: dp(30)
-            BoxLayout:
-                orientation: "vertical"
-                size_hint_y: None
-                height: dp(150)
-                Button:
-                    id: intent_start_btn
-                    text: "Start Intent Prediction"
-                    on_press: app.send_control_event(ControlEventKind.START_INTENT_PREDICTION)
-                Button:
-                    id: intent_stop_btn
-                    text: "Stop Intent Prediction"
-                    on_press: app.send_control_event(ControlEventKind.STOP_INTENT_PREDICTION)
-                Button:
-                    text: "Save Frames"
-                    on_press: app.toggle_intent_frame_saving()
-            Label:
-                text: "Latest Prediction:"
-                size_hint_y: None
-                height: dp(30)
-                font_size: dp(14)
-                bold: True
-            Label:
-                id: prediction_label
-                text: "No prediction yet"
-                size_hint_y: None
-                height: dp(120)
-                text_size: self.width, None
-                halign: "left"
-                valign: "top"
-                font_size: dp(16)
-                markup: True
             Widget:
                 # Spacer
 
@@ -715,12 +679,12 @@ class HeatmapVisualizer:
             self.decay_factor = 0.4
         else:  # balanced
             self.update_every_n_frames = 25
-            self.max_gaze_points = 30
-            self.sigma = 20.0
+            self.max_gaze_points = 70
+            self.sigma = 40.0
             self.decay_factor = 0.4
         
         # Recompute kernel with new sigma
-        self.kernel_size = int(self.sigma * 6.0)
+        self.kernel_size = int(self.sigma * 2.5)
         self.gaussian_kernel = self._precompute_gaussian_kernel()
         
         # Update deque size
@@ -737,7 +701,7 @@ class HeatmapVisualizer:
     def set_blur_radius(self, radius):
         """Set the blur radius (sigma) for Gaussian blobs."""
         self.sigma = max(10.0, min(radius, 100.0))
-        self.kernel_size = int(self.sigma * 6.0)
+        self.kernel_size = int(self.sigma * 1.5)
         self.gaussian_kernel = self._precompute_gaussian_kernel()
         logging.info(f"Heatmap blur radius set to: {self.sigma}")
     
@@ -773,11 +737,6 @@ class G3App(App, ScreenManager):
         self.replay_gaze_circle = None
         self.last_texture = None
         self.draw_frame_event = None
-        
-        # Initialize intent predictor
-        self.intent_predictor = IntentPredictor()
-        self.intent_prediction_task: Optional[asyncio.Task] = None
-        self.prediction_update_event = None
 
     def build(self):
         return self
@@ -923,10 +882,6 @@ class G3App(App, ScreenManager):
                 self.start_heatmap()
             case ControlEventKind.STOP_HEATMAP:
                 self.stop_heatmap()
-            case ControlEventKind.START_INTENT_PREDICTION:
-                self.start_intent_prediction()
-            case ControlEventKind.STOP_INTENT_PREDICTION:
-                self.stop_intent_prediction()
         self.get_screen("control").set_task_running_status(False)
 
     def start_live_stream(self, g3: Glasses3) -> None:
@@ -1015,14 +970,6 @@ class G3App(App, ScreenManager):
                 if processed_image is None or processed_image.size == 0:
                     processed_image = original_image
                     logging.warning("Using original image due to invalid heatmap")
-                
-                # Update intent predictor with frames (original scene + processed heatmap overlay)
-                if self.intent_predictor and processed_image is not None:
-                    try:
-                        self.intent_predictor.update_frames(original_image, processed_image)
-                    except Exception as e:
-                        logging.error(f"Failed to update intent predictor frames: {e}")
-                
                 texture = Texture.create(
                     size=(processed_image.shape[1], processed_image.shape[0]), colorfmt="bgr"
                 )
@@ -1075,10 +1022,6 @@ class G3App(App, ScreenManager):
         if self.draw_frame_event is not None:
             self.draw_frame_event.cancel()
             self.draw_frame_event = None
-        
-        # Stop intent prediction when live stream stops
-        self.stop_intent_prediction()
-        
         # Reset heatmap visualizer
         if self.live_heatmap_visualizer is not None and not self.live_heatmap_visualizer.is_enabled:
             self.live_heatmap_visualizer.reset()
@@ -1288,162 +1231,6 @@ class G3App(App, ScreenManager):
             logging.info("Heatmap reset by user")
         else:
             logging.warning("No active heatmap visualizer to reset")
-    
-    def start_intent_prediction(self):
-        """Start intent prediction background task."""
-        if not self.intent_predictor.enable_prediction():
-            logging.warning("Failed to enable intent prediction - check API key and OpenAI availability")
-            self._update_prediction_status("Error: Check API key", error=True)
-            return
-        
-        # Start background prediction task
-        if self.intent_prediction_task is None or self.intent_prediction_task.done():
-            self.intent_prediction_task = self.create_task(
-                self.intent_prediction_background_task(), name="intent_prediction_task"
-            )
-            
-        # Start UI update task with more frequent updates for responsiveness
-        if self.prediction_update_event is None:
-            self.prediction_update_event = Clock.schedule_interval(
-                self.update_prediction_ui, 0.2  # Update UI every 200ms for better responsiveness
-            )
-            
-        # Update UI immediately to show started status
-        self._update_prediction_status("Starting...", starting=True)
-        logging.info("Intent prediction started")
-    
-    def stop_intent_prediction(self):
-        """Stop intent prediction background task."""
-        self.intent_predictor.disable_prediction()
-        
-        if self.intent_prediction_task is not None:
-            self.intent_prediction_task.cancel()
-            self.intent_prediction_task = None
-            
-        if self.prediction_update_event is not None:
-            self.prediction_update_event.cancel()
-            self.prediction_update_event = None
-            
-        # Update UI to show stopped status
-        self._update_prediction_status("Intent prediction stopped")
-        logging.info("Intent prediction stopped")
-    
-    async def intent_prediction_background_task(self):
-        """Background task that runs intent prediction continuously with proper timing."""
-        try:
-            logging.info("Intent prediction background task started")
-            while True:
-                if self.intent_predictor.is_enabled:
-                    try:
-                        # Run prediction asynchronously - this now includes the 0.1s wait internally
-                        prediction = await self.intent_predictor.predict_intent_async()
-                        if prediction:
-                            logging.debug(f"Background prediction: {prediction['prediction']} (took {prediction.get('duration_ms', 0):.1f}ms)")
-                    except Exception as e:
-                        logging.error(f"Intent prediction background task error: {e}")
-                        # Small delay after error to prevent rapid retries
-                        await asyncio.sleep(0.1)
-                else:
-                    # Small sleep when disabled to quickly detect re-enabling
-                    await asyncio.sleep(0.1)
-                
-        except asyncio.CancelledError:
-            logging.info("Intent prediction background task cancelled")
-        except Exception as e:
-            logging.error(f"Intent prediction background task failed: {e}")
-        finally:
-            logging.info("Intent prediction background task ended")
-    
-    def update_prediction_ui(self, dt):
-        """Update the prediction UI with latest results (called by Clock)."""
-        _ = dt  # Unused parameter from Clock.schedule_interval
-        try:
-            # Only update if we're on the live screen and prediction is enabled
-            if self.current != "control":
-                return
-                
-            control_screen = self.get_screen("control")
-            if control_screen.ids.sm.current != "live":
-                return
-                
-            latest = self.intent_predictor.get_latest_prediction_safe()
-            if latest:
-                
-                # Update the prediction label in the UI
-                live_screen = control_screen.ids.sm.get_screen("live")
-                if hasattr(live_screen.ids, 'prediction_label'):
-                    # Format prediction text with better structure and markup
-                    action = latest.get('prediction', 'unknown')
-                    prediction_text = f"[b][size=18][color=00ff00]Action:[/color][/size][/b]\n{action}"
-                    
-                    reasoning = latest.get('reasoning', 'N/A')
-                    if len(reasoning) > 120:  # Allow more text with larger space
-                        reasoning = reasoning[:117] + "..."
-                    prediction_text += f"\n\n[b][size=14][color=ffff00]Reason:[/color][/size][/b]\n{reasoning}"
-                    
-                    if 'duration_ms' in latest:
-                        prediction_text += f"\n\n[size=12][color=cccccc]Time: {latest['duration_ms']:.1f}ms[/color][/size]"
-                    
-                    # Add timestamp for debugging
-                    if 'timestamp' in latest:
-                        import datetime
-                        dt_obj = datetime.datetime.fromtimestamp(latest['timestamp'])
-                        prediction_text += f"\n[size=12][color=cccccc]Updated: {dt_obj.strftime('%H:%M:%S')}[/color][/size]"
-                    
-                    live_screen.ids.prediction_label.text = prediction_text
-                    
-                    # Log successful UI update
-                    logging.debug(f"UI updated with prediction: {latest.get('prediction', 'unknown')}")
-                else:
-                    logging.warning("prediction_label not found in live screen")
-                    
-        except Exception as e:
-            logging.error(f"Failed to update prediction UI: {e}")
-            # Try to show error in UI
-            try:
-                control_screen = self.get_screen("control")
-                live_screen = control_screen.ids.sm.get_screen("live")
-                if hasattr(live_screen.ids, 'prediction_label'):
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=ff0000]Error: Failed to update[/color][/size][/b]\n[size=12]{str(e)[:50]}...[/size]"
-            except Exception:
-                pass  # Ignore secondary errors
-    
-    def _update_prediction_status(self, message: str, error: bool = False, starting: bool = False):
-        """Helper function to update prediction status in UI immediately."""
-        try:
-            if self.current != "control":
-                return
-                
-            control_screen = self.get_screen("control")
-            if control_screen.ids.sm.current != "live":
-                return
-                
-            live_screen = control_screen.ids.sm.get_screen("live")
-            if hasattr(live_screen.ids, 'prediction_label'):
-                if error:
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=ff0000]❌ {message}[/color][/size][/b]"
-                elif starting:
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=00aaff]🔄 {message}[/color][/size][/b]"
-                else:
-                    live_screen.ids.prediction_label.text = f"[size=16]{message}[/size]"
-                    
-                logging.debug(f"Updated prediction status: {message}")
-                
-        except Exception as e:
-            logging.error(f"Failed to update prediction status: {e}")
-    
-    def toggle_intent_frame_saving(self):
-        """Toggle saving of frames for intent prediction."""
-        if hasattr(self.intent_predictor, 'save_images_enabled') and self.intent_predictor.save_images_enabled:
-            self.intent_predictor.disable_image_saving()
-            logging.info("Intent frame saving disabled")
-        else:
-            # Create timestamped directory for this session
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_dir = f"saved_frames_{timestamp}"
-            self.intent_predictor.enable_image_saving(save_dir)
-            logging.info(f"Intent frame saving enabled - directory: {save_dir}")
     
     def set_heatmap_performance_mode(self, mode="balanced"):
         """Set heatmap performance mode: fast, balanced, or quality."""

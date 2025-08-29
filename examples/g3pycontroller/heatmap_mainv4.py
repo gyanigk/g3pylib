@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 
+import cv2
+
+
 import time
 from collections import deque
 from typing import List, Optional, Set, Tuple, cast
@@ -9,7 +12,6 @@ from typing import List, Optional, Set, Tuple, cast
 import aiohttp
 import numpy as np
 from eventkinds import AppEventKind, ControlEventKind
-from intent_predictor import IntentPredictor
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -169,41 +171,6 @@ Builder.load_string("""
                 Button:
                     text: "Reset Heatmap"
                     on_press: app.reset_heatmap()
-            Label:
-                text: "Intent Prediction"
-                size_hint_y: None
-                height: dp(30)
-            BoxLayout:
-                orientation: "vertical"
-                size_hint_y: None
-                height: dp(150)
-                Button:
-                    id: intent_start_btn
-                    text: "Start Intent Prediction"
-                    on_press: app.send_control_event(ControlEventKind.START_INTENT_PREDICTION)
-                Button:
-                    id: intent_stop_btn
-                    text: "Stop Intent Prediction"
-                    on_press: app.send_control_event(ControlEventKind.STOP_INTENT_PREDICTION)
-                Button:
-                    text: "Save Frames"
-                    on_press: app.toggle_intent_frame_saving()
-            Label:
-                text: "Latest Prediction:"
-                size_hint_y: None
-                height: dp(30)
-                font_size: dp(14)
-                bold: True
-            Label:
-                id: prediction_label
-                text: "No prediction yet"
-                size_hint_y: None
-                height: dp(120)
-                text_size: self.width, None
-                halign: "left"
-                valign: "top"
-                font_size: dp(16)
-                markup: True
             Widget:
                 # Spacer
 
@@ -382,378 +349,6 @@ class GazeCircle:
         self.canvas.add(self.circle_obj)
 
 
-class HeatmapVisualizer:
-    def __init__(self, width, height) -> None:
-        self.width = width
-        self.height = height
-        
-        # Heatmap configuration - Optimized for performance
-        self.sigma = 40.0  # Reduced Gaussian blob size for better performance
-        self.max_intensity = 1.0
-        self.blend_alpha = 0.5  # Transparency for overlay
-        
-        # Sliding window configuration
-        self.max_gaze_points = 30  # Reduced for better performance
-        self.gaze_history = deque(maxlen=self.max_gaze_points)
-        
-        # Initialize heatmap data
-        self.heatmap = np.zeros((height, width), dtype=np.float32)
-        
-        # Performance optimization: Pre-compute Gaussian kernel
-        self.kernel_size = int(self.sigma * 1.5)  # Reduced from 2 sigma to 1.5 sigma
-        self.gaussian_kernel = self._precompute_gaussian_kernel()
-        
-        # Initialize colormap for heatmap visualization
-        self._initialize_colormap()
-        
-        # Performance tracking
-        self.frame_skip_counter = 0
-        self.update_every_n_frames = 2  # Only update heatmap every N frames
-        
-        # Decay factor for gradual fading
-        self.decay_factor = 0.98  # Slight decay per frame to prevent accumulation
-        
-        # Control state
-        self.is_enabled = True  # Start with heatmap enabled by default
-        
-        logging.info(f"HeatmapVisualizer initialized: {width}x{height} with optimized sliding window")
-    
-    def _precompute_gaussian_kernel(self):
-        """Pre-compute Gaussian kernel for faster blob generation."""
-        kernel_size = self.kernel_size
-        kernel = np.zeros((2 * kernel_size + 1, 2 * kernel_size + 1), dtype=np.float32)
-        center = kernel_size
-        
-        # Create coordinate grids relative to center
-        y, x = np.ogrid[-center:center+1, -center:center+1]
-        
-        # Calculate Gaussian values
-        dist_sq = x**2 + y**2
-        kernel = np.exp(-dist_sq / (2 * self.sigma**2))
-        
-        return kernel
-    
-    def _initialize_colormap(self):
-        """Initialize red-orange colormap for heatmap visualization."""
-        self.hot_colormap = np.zeros((256, 3), dtype=np.uint8)
-        for i in range(256):
-            # Red-orange colormap: black -> deep red -> orange -> light orange
-            if i < 64:
-                # Black to deep red
-                self.hot_colormap[i] = [i * 4, 0, 0]
-            elif i < 128:
-                # Deep red to red-orange
-                self.hot_colormap[i] = [255, (i - 64) * 4, 0]
-            elif i < 192:
-                # Red-orange to bright orange (keep blue at 0)
-                self.hot_colormap[i] = [255, 255, 0]  # Pure orange, no blue
-            else:
-                # Bright orange to light orange (still no blue)
-                self.hot_colormap[i] = [255, 255, 0]  # Keep pure orange
-    
-    # def _initialize_colormap(self):
-    #     """Initialize hot colormap for heatmap visualization."""
-    #     self.hot_colormap = np.zeros((256, 3), dtype=np.uint8)
-    #     for i in range(256):
-    #         # Hot colormap: black -> red -> yellow -> white
-    #         if i < 85:
-    #             # Black to red
-    #             self.hot_colormap[i] = [i * 3, 0, 0]
-    #         elif i < 170:
-    #             # Red to yellow
-    #             self.hot_colormap[i] = [255, (i - 85) * 3, 0]
-    #         else:
-    #             # Yellow to white
-    #             self.hot_colormap[i] = [255, 255, (i - 170) * 3]
-    
-    def enable_heatmap(self):
-        """Enable heatmap visualization."""
-        self.is_enabled = True
-        logging.info("Heatmap visualization enabled")
-    
-    def disable_heatmap(self):
-        """Disable heatmap visualization."""
-        self.is_enabled = False
-        logging.info("Heatmap visualization disabled at timestamp: %s", time.time())
-    
-    def set_sliding_window_size(self, size: int):
-        """
-        Update the sliding window size for gaze points.
-        
-        Args:
-            size: Number of gaze points to keep in the sliding window
-        """
-        self.max_gaze_points = max(10, min(size, 50))  # Clamp between 10-300
-        
-        # Update the deque with new maxlen
-        current_points = list(self.gaze_history)
-        self.gaze_history = deque(current_points[-self.max_gaze_points:], maxlen=self.max_gaze_points)
-        
-        logging.info(f"Sliding window size updated to {self.max_gaze_points} points")
-    
-    def update_gaze_data(self, gaze_point, timestamp):
-        """Update heatmap with new gaze data using optimized approach."""
-        if not self.is_enabled or gaze_point is None or len(gaze_point) != 2:
-            return
-        
-        # Frame skipping for performance
-        self.frame_skip_counter += 1
-        if self.frame_skip_counter < self.update_every_n_frames:
-            return
-        self.frame_skip_counter = 0
-        
-        # Convert normalized coordinates to heatmap pixel coordinates
-        x = int(gaze_point[0] * self.width)
-        # For y-coordinate, flip to match video frame coordinate system (same as gaze circle)
-        y = int((1 - gaze_point[1]) * self.height)
-        
-        # Ensure coordinates are within bounds
-        x = max(0, min(x, self.width - 1))
-        y = max(0, min(y, self.height - 1))
-        
-        # Apply decay to existing heatmap for gradual fading
-        self.heatmap *= self.decay_factor
-        
-        # Add new gaze point directly using optimized kernel
-        self._add_optimized_gaze_point(x, y)
-        
-        # Keep track of gaze history for potential full rebuilds
-        self.gaze_history.append({
-            'x': x,
-            'y': y,
-            'timestamp': timestamp
-        })
-        
-        # Clamp intensities to prevent overflow
-        np.clip(self.heatmap, 0, self.max_intensity, out=self.heatmap)
-    
-    def _add_optimized_gaze_point(self, x, y):
-        """Add a gaze point using pre-computed Gaussian kernel for maximum performance."""
-        if not (0 <= x < self.width and 0 <= y < self.height):
-            return
-        
-        kernel_size = self.kernel_size
-        
-        # Calculate bounds for kernel placement
-        y1 = max(0, y - kernel_size)
-        y2 = min(self.height, y + kernel_size + 1)
-        x1 = max(0, x - kernel_size)
-        x2 = min(self.width, x + kernel_size + 1)
-        
-        # Calculate corresponding kernel bounds
-        ky1 = max(0, kernel_size - y)
-        ky2 = ky1 + (y2 - y1)
-        kx1 = max(0, kernel_size - x)
-        kx2 = kx1 + (x2 - x1)
-        
-        # Add the pre-computed kernel to the heatmap
-        try:
-            self.heatmap[y1:y2, x1:x2] += self.gaussian_kernel[ky1:ky2, kx1:kx2]
-        except (ValueError, IndexError):
-            # Fallback for edge cases
-            pass
-    
-    def _create_gaussian_blob(self, x, y):
-        """Legacy method - kept for compatibility. Use _add_optimized_gaze_point instead."""
-        # Calculate the area around the point to update
-        size = self.kernel_size
-        y1, y2 = max(0, y - size), min(self.height, y + size + 1)
-        x1, x2 = max(0, x - size), min(self.width, x + size + 1)
-        
-        if x2 <= x1 or y2 <= y1:
-            return None, None, None, None
-            
-        # Create coordinate grids
-        yy, xx = np.mgrid[y1:y2, x1:x2]
-        
-        # Calculate Gaussian values
-        dist_sq = (xx - x) ** 2 + (yy - y) ** 2
-        gaussian = np.exp(-dist_sq / (2 * self.sigma ** 2))
-        
-        return gaussian, y1, y2, x1, x2
-    
-    def _rebuild_heatmap_from_history(self):
-        """Rebuild the entire heatmap from the current gaze history - used for reset only."""
-        if not self.gaze_history:
-            return
-        
-        # Clear the heatmap and rebuild from scratch
-        self.heatmap.fill(0)
-        
-        # Add all points in the sliding window using optimized method
-        for gaze_point in self.gaze_history:
-            self._add_optimized_gaze_point(gaze_point['x'], gaze_point['y'])
-        
-        # Keep intensities reasonable
-        if self.heatmap.max() > self.max_intensity:
-            self.heatmap *= (self.max_intensity / self.heatmap.max())
-    
-    def _add_gaze_point_to_heatmap(self, x, y):
-        """Legacy method - use _add_optimized_gaze_point instead."""
-        self._add_optimized_gaze_point(x, y)
-    
-    def create_heatmap_overlay(self, video_frame):
-        """Create heatmap overlay blended with video frame - optimized version."""
-        if not self.is_enabled:
-            return video_frame
-        
-        # Check if heatmap has any content
-        heatmap_max = self.heatmap.max()
-        if heatmap_max <= 1e-6:  # Use small threshold instead of exact zero
-            return video_frame
-        
-        # Get video frame dimensions
-        frame_height, frame_width = video_frame.shape[:2]
-        
-        # Use in-place operations to reduce memory allocation
-        # Normalize heatmap to 0-1 range (reuse existing array if possible)
-        normalized_heatmap = self.heatmap.copy() if heatmap_max != 1.0 else self.heatmap
-        if heatmap_max != 1.0:
-            normalized_heatmap /= heatmap_max
-        
-        # Resize heatmap to match video frame dimensions if needed
-        if normalized_heatmap.shape != (frame_height, frame_width):
-            try:
-                import cv2
-                normalized_heatmap = cv2.resize(normalized_heatmap, (frame_width, frame_height), interpolation=cv2.INTER_LINEAR)
-            except ImportError:
-                # Optimized numpy-based resizing with fewer allocations
-                if frame_height != self.height or frame_width != self.width:
-                    y_ratio = self.height / frame_height
-                    x_ratio = self.width / frame_width
-                    y_indices = (np.arange(frame_height) * y_ratio).astype(np.int32)
-                    x_indices = (np.arange(frame_width) * x_ratio).astype(np.int32)
-                    # Clamp indices to prevent out-of-bounds
-                    y_indices = np.clip(y_indices, 0, self.height - 1)
-                    x_indices = np.clip(x_indices, 0, self.width - 1)
-                    normalized_heatmap = normalized_heatmap[np.ix_(y_indices, x_indices)]
-        
-        # Skip blending if heatmap is too weak
-        if normalized_heatmap.max() < 0.01:
-            return video_frame
-        
-        # Optimized colormap application
-        # Use threshold to only process non-zero areas
-        mask = normalized_heatmap > 0.01
-        if not mask.any():
-            return video_frame
-        
-        # Apply colormap only to non-zero areas
-        heatmap_indices = (normalized_heatmap * 255).astype(np.uint8)
-        colored_heatmap = self.hot_colormap[heatmap_indices]
-        
-        # Optimized alpha blending using in-place operations
-        if len(video_frame.shape) == 3 and video_frame.shape[2] == 3:
-            alpha = (normalized_heatmap * self.blend_alpha)[..., np.newaxis]
-            
-            # Only blend where alpha > threshold to save computation
-            blend_mask = alpha[..., 0] > 0.01
-            if not blend_mask.any():
-                return video_frame
-            
-            # Create result frame (avoid copy if possible)
-            result = video_frame.copy()
-            
-            # Vectorized blending only on relevant pixels
-            inv_alpha = 1 - alpha
-            result[blend_mask] = (
-                video_frame[blend_mask].astype(np.float32) * inv_alpha[blend_mask] +
-                colored_heatmap[blend_mask].astype(np.float32) * alpha[blend_mask]
-            ).astype(np.uint8)
-            
-            return result
-        
-        return video_frame
-    
-    def create_heatmap_texture(self):
-        """Create standalone heatmap texture for debugging/saving."""
-        if self.heatmap.max() == 0:
-            return None
-        
-        # Normalize heatmap to 0-255 range
-        normalized = (self.heatmap / self.heatmap.max() * 255).astype(np.uint8)
-        
-        # Apply colormap
-        colored = self.hot_colormap[normalized]
-        
-        # Add alpha channel for blending
-        rgba_heatmap = np.zeros((self.height, self.width, 4), dtype=np.uint8)
-        rgba_heatmap[:, :, :3] = colored
-        rgba_heatmap[:, :, 3] = (normalized * self.blend_alpha).astype(np.uint8)
-        
-        # Flip for Kivy coordinate system
-        rgba_heatmap = np.flipud(rgba_heatmap)
-        
-        # Create texture
-        texture = Texture.create(size=(self.width, self.height))
-        texture.blit_buffer(rgba_heatmap.tobytes(), colorfmt='rgba', bufferfmt='ubyte')
-        
-        return texture
-        
-    def reset(self):
-        """Reset heatmap data."""
-        self.heatmap.fill(0)
-        self.gaze_history.clear()
-        logging.info("HeatmapVisualizer reset")
-    
-    def set_performance_mode(self, mode="balanced"):
-        """
-        Set performance mode for heatmap visualization.
-        
-        Args:
-            mode: "fast", "balanced", or "quality"
-        """
-        if mode == "fast":
-            self.update_every_n_frames = 3
-            self.max_gaze_points = 20
-            self.sigma = 30.0
-            self.decay_factor = 0.95
-        elif mode == "quality":
-            self.update_every_n_frames = 1
-            self.max_gaze_points = 50
-            self.sigma = 50.0
-            self.decay_factor = 0.4
-        else:  # balanced
-            self.update_every_n_frames = 25
-            self.max_gaze_points = 30
-            self.sigma = 20.0
-            self.decay_factor = 0.4
-        
-        # Recompute kernel with new sigma
-        self.kernel_size = int(self.sigma * 6.0)
-        self.gaussian_kernel = self._precompute_gaussian_kernel()
-        
-        # Update deque size
-        current_points = list(self.gaze_history)
-        self.gaze_history = deque(current_points[-self.max_gaze_points:], maxlen=self.max_gaze_points)
-        
-        logging.info(f"Performance mode set to: {mode}")
-    
-    def set_update_frequency(self, frames_to_skip):
-        """Set how many frames to skip between heatmap updates."""
-        self.update_every_n_frames = max(1, min(frames_to_skip, 10))
-        logging.info(f"Heatmap update frequency set to every {self.update_every_n_frames} frames")
-    
-    def set_blur_radius(self, radius):
-        """Set the blur radius (sigma) for Gaussian blobs."""
-        self.sigma = max(10.0, min(radius, 100.0))
-        self.kernel_size = int(self.sigma * 6.0)
-        self.gaussian_kernel = self._precompute_gaussian_kernel()
-        logging.info(f"Heatmap blur radius set to: {self.sigma}")
-    
-    def get_performance_stats(self):
-        """Get current performance statistics."""
-        return {
-            'gaze_points_in_history': len(self.gaze_history),
-            'max_gaze_points': self.max_gaze_points,
-            'heatmap_max_intensity': float(self.heatmap.max()),
-            'is_enabled': self.is_enabled,
-            'update_frequency': self.update_every_n_frames,
-            'blur_radius': self.sigma,
-            'decay_factor': self.decay_factor,
-            'kernel_size': self.kernel_size
-        }
-
 
 class G3App(App, ScreenManager):
     def __init__(self, **kwargs):
@@ -773,11 +368,6 @@ class G3App(App, ScreenManager):
         self.replay_gaze_circle = None
         self.last_texture = None
         self.draw_frame_event = None
-        
-        # Initialize intent predictor
-        self.intent_predictor = IntentPredictor()
-        self.intent_prediction_task: Optional[asyncio.Task] = None
-        self.prediction_update_event = None
 
     def build(self):
         return self
@@ -923,10 +513,6 @@ class G3App(App, ScreenManager):
                 self.start_heatmap()
             case ControlEventKind.STOP_HEATMAP:
                 self.stop_heatmap()
-            case ControlEventKind.START_INTENT_PREDICTION:
-                self.start_intent_prediction()
-            case ControlEventKind.STOP_INTENT_PREDICTION:
-                self.stop_intent_prediction()
         self.get_screen("control").set_task_running_status(False)
 
     def start_live_stream(self, g3: Glasses3) -> None:
@@ -1015,14 +601,6 @@ class G3App(App, ScreenManager):
                 if processed_image is None or processed_image.size == 0:
                     processed_image = original_image
                     logging.warning("Using original image due to invalid heatmap")
-                
-                # Update intent predictor with frames (original scene + processed heatmap overlay)
-                if self.intent_predictor and processed_image is not None:
-                    try:
-                        self.intent_predictor.update_frames(original_image, processed_image)
-                    except Exception as e:
-                        logging.error(f"Failed to update intent predictor frames: {e}")
-                
                 texture = Texture.create(
                     size=(processed_image.shape[1], processed_image.shape[0]), colorfmt="bgr"
                 )
@@ -1075,10 +653,6 @@ class G3App(App, ScreenManager):
         if self.draw_frame_event is not None:
             self.draw_frame_event.cancel()
             self.draw_frame_event = None
-        
-        # Stop intent prediction when live stream stops
-        self.stop_intent_prediction()
-        
         # Reset heatmap visualizer
         if self.live_heatmap_visualizer is not None and not self.live_heatmap_visualizer.is_enabled:
             self.live_heatmap_visualizer.reset()
@@ -1288,162 +862,6 @@ class G3App(App, ScreenManager):
             logging.info("Heatmap reset by user")
         else:
             logging.warning("No active heatmap visualizer to reset")
-    
-    def start_intent_prediction(self):
-        """Start intent prediction background task."""
-        if not self.intent_predictor.enable_prediction():
-            logging.warning("Failed to enable intent prediction - check API key and OpenAI availability")
-            self._update_prediction_status("Error: Check API key", error=True)
-            return
-        
-        # Start background prediction task
-        if self.intent_prediction_task is None or self.intent_prediction_task.done():
-            self.intent_prediction_task = self.create_task(
-                self.intent_prediction_background_task(), name="intent_prediction_task"
-            )
-            
-        # Start UI update task with more frequent updates for responsiveness
-        if self.prediction_update_event is None:
-            self.prediction_update_event = Clock.schedule_interval(
-                self.update_prediction_ui, 0.2  # Update UI every 200ms for better responsiveness
-            )
-            
-        # Update UI immediately to show started status
-        self._update_prediction_status("Starting...", starting=True)
-        logging.info("Intent prediction started")
-    
-    def stop_intent_prediction(self):
-        """Stop intent prediction background task."""
-        self.intent_predictor.disable_prediction()
-        
-        if self.intent_prediction_task is not None:
-            self.intent_prediction_task.cancel()
-            self.intent_prediction_task = None
-            
-        if self.prediction_update_event is not None:
-            self.prediction_update_event.cancel()
-            self.prediction_update_event = None
-            
-        # Update UI to show stopped status
-        self._update_prediction_status("Intent prediction stopped")
-        logging.info("Intent prediction stopped")
-    
-    async def intent_prediction_background_task(self):
-        """Background task that runs intent prediction continuously with proper timing."""
-        try:
-            logging.info("Intent prediction background task started")
-            while True:
-                if self.intent_predictor.is_enabled:
-                    try:
-                        # Run prediction asynchronously - this now includes the 0.1s wait internally
-                        prediction = await self.intent_predictor.predict_intent_async()
-                        if prediction:
-                            logging.debug(f"Background prediction: {prediction['prediction']} (took {prediction.get('duration_ms', 0):.1f}ms)")
-                    except Exception as e:
-                        logging.error(f"Intent prediction background task error: {e}")
-                        # Small delay after error to prevent rapid retries
-                        await asyncio.sleep(0.1)
-                else:
-                    # Small sleep when disabled to quickly detect re-enabling
-                    await asyncio.sleep(0.1)
-                
-        except asyncio.CancelledError:
-            logging.info("Intent prediction background task cancelled")
-        except Exception as e:
-            logging.error(f"Intent prediction background task failed: {e}")
-        finally:
-            logging.info("Intent prediction background task ended")
-    
-    def update_prediction_ui(self, dt):
-        """Update the prediction UI with latest results (called by Clock)."""
-        _ = dt  # Unused parameter from Clock.schedule_interval
-        try:
-            # Only update if we're on the live screen and prediction is enabled
-            if self.current != "control":
-                return
-                
-            control_screen = self.get_screen("control")
-            if control_screen.ids.sm.current != "live":
-                return
-                
-            latest = self.intent_predictor.get_latest_prediction_safe()
-            if latest:
-                
-                # Update the prediction label in the UI
-                live_screen = control_screen.ids.sm.get_screen("live")
-                if hasattr(live_screen.ids, 'prediction_label'):
-                    # Format prediction text with better structure and markup
-                    action = latest.get('prediction', 'unknown')
-                    prediction_text = f"[b][size=18][color=00ff00]Action:[/color][/size][/b]\n{action}"
-                    
-                    reasoning = latest.get('reasoning', 'N/A')
-                    if len(reasoning) > 120:  # Allow more text with larger space
-                        reasoning = reasoning[:117] + "..."
-                    prediction_text += f"\n\n[b][size=14][color=ffff00]Reason:[/color][/size][/b]\n{reasoning}"
-                    
-                    if 'duration_ms' in latest:
-                        prediction_text += f"\n\n[size=12][color=cccccc]Time: {latest['duration_ms']:.1f}ms[/color][/size]"
-                    
-                    # Add timestamp for debugging
-                    if 'timestamp' in latest:
-                        import datetime
-                        dt_obj = datetime.datetime.fromtimestamp(latest['timestamp'])
-                        prediction_text += f"\n[size=12][color=cccccc]Updated: {dt_obj.strftime('%H:%M:%S')}[/color][/size]"
-                    
-                    live_screen.ids.prediction_label.text = prediction_text
-                    
-                    # Log successful UI update
-                    logging.debug(f"UI updated with prediction: {latest.get('prediction', 'unknown')}")
-                else:
-                    logging.warning("prediction_label not found in live screen")
-                    
-        except Exception as e:
-            logging.error(f"Failed to update prediction UI: {e}")
-            # Try to show error in UI
-            try:
-                control_screen = self.get_screen("control")
-                live_screen = control_screen.ids.sm.get_screen("live")
-                if hasattr(live_screen.ids, 'prediction_label'):
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=ff0000]Error: Failed to update[/color][/size][/b]\n[size=12]{str(e)[:50]}...[/size]"
-            except Exception:
-                pass  # Ignore secondary errors
-    
-    def _update_prediction_status(self, message: str, error: bool = False, starting: bool = False):
-        """Helper function to update prediction status in UI immediately."""
-        try:
-            if self.current != "control":
-                return
-                
-            control_screen = self.get_screen("control")
-            if control_screen.ids.sm.current != "live":
-                return
-                
-            live_screen = control_screen.ids.sm.get_screen("live")
-            if hasattr(live_screen.ids, 'prediction_label'):
-                if error:
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=ff0000]❌ {message}[/color][/size][/b]"
-                elif starting:
-                    live_screen.ids.prediction_label.text = f"[b][size=16][color=00aaff]🔄 {message}[/color][/size][/b]"
-                else:
-                    live_screen.ids.prediction_label.text = f"[size=16]{message}[/size]"
-                    
-                logging.debug(f"Updated prediction status: {message}")
-                
-        except Exception as e:
-            logging.error(f"Failed to update prediction status: {e}")
-    
-    def toggle_intent_frame_saving(self):
-        """Toggle saving of frames for intent prediction."""
-        if hasattr(self.intent_predictor, 'save_images_enabled') and self.intent_predictor.save_images_enabled:
-            self.intent_predictor.disable_image_saving()
-            logging.info("Intent frame saving disabled")
-        else:
-            # Create timestamped directory for this session
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_dir = f"saved_frames_{timestamp}"
-            self.intent_predictor.enable_image_saving(save_dir)
-            logging.info(f"Intent frame saving enabled - directory: {save_dir}")
     
     def set_heatmap_performance_mode(self, mode="balanced"):
         """Set heatmap performance mode: fast, balanced, or quality."""

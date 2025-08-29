@@ -1,0 +1,8 @@
+# Requirements for G3 Controller with Intent Prediction
+kivy>=2.1.0
+opencv-python>=4.5.0
+numpy>=1.20.0
+pillow>=8.0.0
+aiohttp>=3.8.0
+openai>=1.0.0
+# g3pylib  # Local package from parent directory

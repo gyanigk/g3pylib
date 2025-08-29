@@ -40,7 +40,7 @@ The tests and examples load the glasses hostname, which by default is the serial
 See example content below:
 
 ```
-G3_HOSTNAME=tg03b-080200045321
+set G3_HOSTNAME=tg03b-080200009391
 ```
 
 You can also specify this variable directly in your environment.
